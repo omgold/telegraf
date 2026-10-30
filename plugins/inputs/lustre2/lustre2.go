@@ -254,7 +254,11 @@ func (l *Lustre2) getLustreProcStats(fileglob string, wantedFields []*mapping) e
 			// figure out if the data should be tagged with job_id here
 			parts := strings.Fields(lines[0])
 			if strings.TrimSuffix(parts[0], ":") == "job_id" {
+				// Lustre quotes job IDs containing special characters such as ':'
 				jobid = parts[1]
+				if len(jobid) > 1 && strings.HasPrefix(jobid, `"`) && strings.HasSuffix(jobid, `"`) {
+					jobid = jobid[1 : len(jobid)-1]
+				}
 			}
 
 			for _, line := range lines {
@@ -277,7 +281,7 @@ func (l *Lustre2) getLustreProcStats(fileglob string, wantedFields []*mapping) e
 
 				for _, wanted := range wantedFields {
 					var data uint64
-					if parts[0] == wanted.inProc {
+					if parts[0] == wanted.inProc && (wanted.unit == "" || wanted.unit == lineUnit(parts)) {
 						wantedField := wanted.field
 						// if not set, assume field[1]. Shouldn't be field[0], as
 						// that's a string
@@ -434,12 +438,24 @@ func (l *Lustre2) getLustreEvictionCount(fileglob string) error {
 	return nil
 }
 
+// lineUnit returns the unit of a job_stats line split into parts,
+// e.g. "bytes" for "read_bytes: { samples: 5, unit: bytes, min: 4096, ... }"
+func lineUnit(parts []string) string {
+	for i := 1; i < len(parts)-1; i++ {
+		if parts[i] == "unit" {
+			return strings.TrimSuffix(parts[i+1], ",")
+		}
+	}
+	return ""
+}
+
 // The wanted fields would be a []string, if not for the lines that start with read_bytes/write_bytes
 // and contain both the byte count and the function call count
 type mapping struct {
 	inProc   string // What to look for at the start of a line in /proc/fs/lustre/*
 	field    uint32 // which field to extract from that line
 	reportAs string // What measurement name to use
+	unit     string // if set, only use lines reporting this unit
 }
 
 var wantedBrwstatsFields = []*mapping{
@@ -529,21 +545,25 @@ var wantedOstJobstatsFields = []*mapping{
 		inProc:   "read",
 		field:    3,
 		reportAs: "jobstats_read_calls",
+		unit:     "bytes",
 	},
 	{
 		inProc:   "read",
 		field:    7,
 		reportAs: "jobstats_read_min_size",
+		unit:     "bytes",
 	},
 	{
 		inProc:   "read",
 		field:    9,
 		reportAs: "jobstats_read_max_size",
+		unit:     "bytes",
 	},
 	{
 		inProc:   "read",
 		field:    11,
 		reportAs: "jobstats_read_bytes",
+		unit:     "bytes",
 	},
 	{ // Different inProc for newer versions
 		inProc:   "read_bytes",
@@ -569,21 +589,25 @@ var wantedOstJobstatsFields = []*mapping{
 		inProc:   "write",
 		field:    3,
 		reportAs: "jobstats_write_calls",
+		unit:     "bytes",
 	},
 	{
 		inProc:   "write",
 		field:    7,
 		reportAs: "jobstats_write_min_size",
+		unit:     "bytes",
 	},
 	{
 		inProc:   "write",
 		field:    9,
 		reportAs: "jobstats_write_max_size",
+		unit:     "bytes",
 	},
 	{
 		inProc:   "write",
 		field:    11,
 		reportAs: "jobstats_write_bytes",
+		unit:     "bytes",
 	},
 	{ // Different inProc for newer versions
 		inProc:   "write_bytes",
