@@ -5,6 +5,7 @@ package zfs
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -89,8 +90,10 @@ func (z *Zfs) Gather(acc telegraf.Accumulator) error {
 
 	if z.PoolMetrics && err == nil {
 		for _, pool := range pools {
+			// A problem with one pool must not affect the other pools or the
+			// global stats.
 			if err := z.gatherPoolStats(pool, acc); err != nil {
-				return err
+				acc.AddError(fmt.Errorf("gathering stats of pool %q failed: %w", pool.name, err))
 			}
 		}
 	}
@@ -99,7 +102,7 @@ func (z *Zfs) Gather(acc telegraf.Accumulator) error {
 	for _, metric := range z.KstatMetrics {
 		fn := filepath.Join(z.KstatPath, metric)
 		lines, err := internal.ReadLines(fn)
-		if err != nil {
+		if err != nil || len(lines) == 0 {
 			continue
 		}
 
@@ -178,9 +181,19 @@ func getTags(pools []poolInfo) map[string]string {
 }
 
 func (z *Zfs) gatherPoolStats(pool poolInfo, acc telegraf.Accumulator) error {
+	// Pools and datasets can disappear at any time, e.g. on export or unmount,
+	// so the file might be gone or be empty when reading fails after opening it.
 	lines, err := internal.ReadLines(pool.ioFilename)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			z.Log.Debugf("skipping vanished file %q", pool.ioFilename)
+			return nil
+		}
 		return err
+	}
+	if len(lines) == 0 {
+		z.Log.Debugf("skipping empty file %q", pool.ioFilename)
+		return nil
 	}
 
 	var fields map[string]any
