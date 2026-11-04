@@ -281,6 +281,128 @@ func TestZfsPoolMetrics(t *testing.T) {
 	acc.AssertContainsTaggedFields(t, "zfs_pool", poolMetrics, tags)
 }
 
+func TestZfsPoolsComeAndGo(t *testing.T) {
+	testKstatPath := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(testKstatPath, "arcstats"), []byte(arcstatsContents), 0640))
+
+	addPool := func(name string) {
+		require.NoError(t, os.Mkdir(filepath.Join(testKstatPath, name), 0750))
+		require.NoError(t, os.WriteFile(filepath.Join(testKstatPath, name, "objset-0x20a"), []byte(objsetContents), 0640))
+	}
+
+	plugin := &Zfs{
+		KstatPath:    testKstatPath,
+		KstatMetrics: []string{"arcstats"},
+		PoolMetrics:  true,
+		Log:          testutil.Logger{},
+	}
+
+	gather := func() *testutil.Accumulator {
+		var acc testutil.Accumulator
+		require.NoError(t, plugin.Gather(&acc))
+		require.Empty(t, acc.Errors)
+		return &acc
+	}
+
+	// No pool available yet
+	acc := gather()
+	require.False(t, acc.HasMeasurement("zfs_pool"))
+	require.True(t, acc.HasTag("zfs", "pools"))
+	require.Empty(t, acc.TagValue("zfs", "pools"))
+
+	// Pools showing up are picked up without restarting
+	addPool("first")
+	addPool("second")
+	acc = gather()
+	require.Equal(t, "first::second", acc.TagValue("zfs", "pools"))
+	acc.AssertContainsTaggedFields(t, "zfs_pool", getPoolMetricsNewFormat(), map[string]string{"pool": "first", "dataset": "HOME"})
+	acc.AssertContainsTaggedFields(t, "zfs_pool", getPoolMetricsNewFormat(), map[string]string{"pool": "second", "dataset": "HOME"})
+
+	// Pools going away are not reported anymore
+	require.NoError(t, os.RemoveAll(filepath.Join(testKstatPath, "first")))
+	acc = gather()
+	require.Equal(t, "second", acc.TagValue("zfs", "pools"))
+	acc.AssertDoesNotContainsTaggedFields(t, "zfs_pool", getPoolMetricsNewFormat(), map[string]string{"pool": "first", "dataset": "HOME"})
+	acc.AssertContainsTaggedFields(t, "zfs_pool", getPoolMetricsNewFormat(), map[string]string{"pool": "second", "dataset": "HOME"})
+
+	// All pools gone
+	require.NoError(t, os.RemoveAll(filepath.Join(testKstatPath, "second")))
+	acc = gather()
+	require.False(t, acc.HasMeasurement("zfs_pool"))
+	require.Empty(t, acc.TagValue("zfs", "pools"))
+}
+
+func TestZfsPoolProblems(t *testing.T) {
+	tests := []struct {
+		name          string
+		setup         func(t *testing.T, filename string)
+		expectedError string
+	}{
+		{
+			// A dangling link is found on discovery but is gone when reading it,
+			// the same as a dataset being unmounted between those two steps.
+			name: "file vanished",
+			setup: func(t *testing.T, filename string) {
+				require.NoError(t, os.Symlink(filename+".gone", filename))
+			},
+		},
+		{
+			name: "empty file",
+			setup: func(t *testing.T, filename string) {
+				require.NoError(t, os.WriteFile(filename, nil, 0640))
+			},
+		},
+		{
+			name: "single line",
+			setup: func(t *testing.T, filename string) {
+				require.NoError(t, os.WriteFile(filename, []byte("ONLINE\n"), 0640))
+			},
+			expectedError: "expected at least 2 lines",
+		},
+		{
+			name: "invalid file",
+			setup: func(t *testing.T, filename string) {
+				require.NoError(t, os.WriteFile(filename, []byte("foo\nbar\n"), 0640))
+			},
+			expectedError: "invalid header",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			testKstatPath := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(testKstatPath, "arcstats"), []byte(arcstatsContents), 0640))
+			for _, pool := range []string{"broken", "working"} {
+				require.NoError(t, os.Mkdir(filepath.Join(testKstatPath, pool), 0750))
+			}
+			tc.setup(t, filepath.Join(testKstatPath, "broken", "objset-0x20a"))
+			require.NoError(t, os.WriteFile(filepath.Join(testKstatPath, "working", "objset-0x20a"), []byte(objsetContents), 0640))
+
+			plugin := &Zfs{
+				KstatPath:    testKstatPath,
+				KstatMetrics: []string{"arcstats"},
+				PoolMetrics:  true,
+				Log:          testutil.Logger{},
+			}
+
+			var acc testutil.Accumulator
+			require.NoError(t, plugin.Gather(&acc))
+
+			if tc.expectedError == "" {
+				require.Empty(t, acc.Errors)
+			} else {
+				require.Len(t, acc.Errors, 1)
+				require.ErrorContains(t, acc.Errors[0], `pool "broken"`)
+				require.ErrorContains(t, acc.Errors[0], tc.expectedError)
+			}
+
+			// The other pool and the global stats must still be reported
+			acc.AssertContainsTaggedFields(t, "zfs_pool", getPoolMetricsNewFormat(), map[string]string{"pool": "working", "dataset": "HOME"})
+			require.True(t, acc.HasMeasurement("zfs"))
+		})
+	}
+}
+
 func TestZfsGeneratesMetrics(t *testing.T) {
 	tmpDir := t.TempDir()
 
